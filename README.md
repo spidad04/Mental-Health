@@ -111,9 +111,11 @@ Contributions are welcome! If you'd like to improve this project, please open an
 
 📝 Authors
 
+Edwin Kumadoh
+
 Gabriel Agbobli
 
-Edwin Kumadoh
+
 
 
 For any inquiries, please contact the authors or open an issue in this repository.
