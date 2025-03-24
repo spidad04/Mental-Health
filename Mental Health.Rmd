@@ -1,0 +1,380 @@
+---
+title: "Key Identifiers of Depression Using Machine Learning"
+author: "Gabriel Agbobli, Edwin Kumadoh"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+#Loading necessary libraries and data
+library(tidyverse)
+library(rsample)
+library(tune)
+library(yardstick)
+library(dials)
+library(recipes)
+library(workflows)
+library(parsnip)
+library(themis)
+library(Boruta)
+library(vip)
+library(iml)
+
+mental_health <- read_csv("C:\\Users\\EDWIN\\OneDrive\\Desktop\\Raw Data.csv")
+
+#Data cleaning
+colnames(mental_health) <- c("Age", "Gender", "University", "Department", "Academic_Year", "Current_CGPA", "Scholarship_Received", "Nervousness_Frequency", "Worry_Frequency",  "Relaxation_Difficulty", "Irritation_Frequency", "Excessive_Worry", "Restlessness", 
+"Fear_Frequency", "Anxiety_Score", "Anxiety_Label", "Academic_Upset", "Loss_of_Control", "Stress_Frequency", "Coping_Difficulty", "Confidence_Level", "Academic_Control",   "Irritation_Control", "Performance_Satisfaction", "Anger_Due_To_Grades", "Overwhelmed_Frequency",  
+"Stress_Score", "Stress_Label", "Loss_of_Interest", "Depression_Frequency", "Sleep_Disturbance",  
+"Fatigue", "Appetite_Changes", "Self_Worth", "Concentration_Difficulty", "Movement_Changes",  
+"Suicidal_Thoughts", "Depression_Score", "Depression_Label")
+
+mental_health <- mental_health |> 
+  select(-Depression_Frequency, -Depression_Score,
+         -Anxiety_Score, -Stress_Score, -Anxiety_Label) |> 
+  mutate_if(is.character, factor)
+```
+
+
+```{r}
+#Distribution of the dependent variable
+mental_health |> 
+  mutate(Depression_Label = factor(Depression_Label,
+                                   levels = c(
+                                     "No Depression",
+                                     "Minimal Depression", 
+                                     "Mild Depression", 
+                                     "Moderate Depression",
+                                     "Moderately Severe 
+                                     Depression", "Severe 
+                                     Depression"))) |> 
+  ggplot(aes(Depression_Label)) +
+  geom_bar() +
+  labs(x = "Depression") +
+  coord_flip() +
+  theme_minimal()
+```
+
+
+```{r feature-selection}
+#Boruta feature selection to identify top 10 predictors of depression
+
+set.seed(123)
+boruta_result <- Boruta(Depression_Label ~ .,
+                        data = mental_health,
+                        doTrace = 2)
+
+boruta_importance <- attStats(boruta_result) |>
+  filter(decision == "Confirmed") |>
+  arrange(desc(meanImp))
+
+top_10_features <- rownames(boruta_importance)[1:10]
+```
+
+
+
+```{r train-test}
+#Splitting the data
+set.seed(1234)
+mh_split <- initial_split(
+  mental_health |> 
+    select(all_of(top_10_features), Depression_Label), 
+  prop = 0.7, 
+  strata = Depression_Label)
+
+mh_train <- training(mh_split)
+mh_test <- testing(mh_split)
+
+#Validation set
+set.seed(12341)
+mh_fold <- vfold_cv(mh_train, strata = Depression_Label)
+```
+
+
+```{r random-forest}
+ranger_recipe <- 
+  recipe(Depression_Label ~ ., data = mh_train)# |>   
+  step_smote(Depression_Label) #To handle class imbalance
+
+ranger_spec <- 
+  rand_forest(mtry = tune("mtry"),
+              min_n = tune("min_n"), 
+              trees = 1000)  |>  
+  set_mode("classification") |>  
+  set_engine("ranger")
+
+ranger_workflow <- 
+  workflow()  |>  
+  add_recipe(ranger_recipe)  |>  
+  add_model(ranger_spec) 
+
+rf_params <- extract_parameter_set_dials(ranger_spec) |> 
+  update(mtry = mtry(range = c(1, 10)),
+         min_n = min_n())
+  
+set.seed(93556)
+ranger_tune <-
+  tune_bayes(ranger_workflow, 
+             resamples = mh_fold,
+             param_info = rf_params,
+             iter = 10,
+             initial = 15,
+             control = control_bayes(verbose = T,
+                                     verbose_iter = T),
+             metrics = metric_set(pr_auc, accuracy, f_meas))
+
+best_ranger <- select_best(ranger_tune,
+                             metric = "pr_auc")
+
+#Finalizing workflow
+final_ranger_wf <- finalize_workflow(ranger_workflow,
+                                       best_ranger)
+
+#Fitting the model
+final_ranger_fit <- last_fit(final_ranger_wf, mh_split)
+
+#Test Metrics
+#Pr-AUC
+final_ranger_fit |> 
+  collect_predictions() |> 
+  pr_auc(Depression_Label, `.pred_Mild Depression`,
+         `.pred_Minimal Depression`, 
+         `.pred_Moderate Depression`,,
+         `.pred_Moderately Severe Depression`,
+         `.pred_No Depression`, `.pred_Severe Depression`)
+
+#Accuracy
+final_ranger_fit |> 
+  collect_predictions() |> 
+  accuracy(.pred_class, Depression_Label)
+
+#F1 score
+final_ranger_fit |> 
+  collect_predictions() |> 
+  f_meas(.pred_class, Depression_Label)
+```
+
+
+```{r neural-network}
+ann_recipe <- recipe(Depression_Label ~ ., 
+                     data = mh_train) |> 
+  step_normalize(all_numeric_predictors()) |> 
+  step_smote(Depression_Label)
+
+ann_spec <- mlp(penalty = tune("penalty"),
+                epochs = tune("epochs")) |> 
+  set_mode("classification")
+
+ann_workflow <- workflow() |> 
+  add_recipe(ann_recipe) |> 
+  add_model(ann_spec)
+
+ann_params <- parameters(ann_spec) |> 
+  update(epochs = epochs(),
+         penalty = penalty())
+
+set.seed(2341)
+ann_tune <- 
+  tune_bayes(ann_workflow, 
+             resamples = mh_fold,
+             param_info = ann_params,
+             iter = 10,
+             initial = 15,
+             control = control_bayes(verbose = T,
+                                     verbose_iter = T),
+             metrics = metric_set(pr_auc, accuracy, f_meas))
+
+#Finalizing model based on best parameters
+best_ann <- select_best(ann_tune, metric = "pr_auc")
+
+final_ann_wf <- finalize_workflow(ann_workflow, best_ann)
+
+final_ann_fit <- last_fit(final_ann_wf, mh_split)
+
+#Test Metrics
+#Pr-AUC
+final_ann_fit |> 
+  collect_predictions() |> 
+  pr_auc(Depression_Label, `.pred_Mild Depression`,
+         `.pred_Minimal Depression`, 
+         `.pred_Moderate Depression`,,
+         `.pred_Moderately Severe Depression`,
+         `.pred_No Depression`, `.pred_Severe Depression`)
+
+#Accuracy
+final_ann_fit |> 
+  collect_predictions() |> 
+  accuracy(.pred_class, Depression_Label)
+
+#F1 score
+final_ann_fit |> 
+  collect_predictions() |> 
+  f_meas(.pred_class, Depression_Label)
+```
+
+
+```{r knn}
+kknn_recipe <- 
+  recipe(formula = Depression_Label ~ Self_Worth + 
+         Suicidal_Thoughts + Fatigue + Concentration_Difficulty+
+           Appetite_Changes + Movement_Changes + 
+           Sleep_Disturbance + Loss_of_Interest + Fear_Frequency+
+           Excessive_Worry, data = mh_train) %>% 
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_numeric_predictors()) |> 
+  step_smote(Depression_Label)
+
+kknn_spec <- 
+  nearest_neighbor(neighbors = tune(), weight_func = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("kknn") 
+
+kknn_workflow <- 
+  workflow() %>% 
+  add_recipe(kknn_recipe) %>% 
+  add_model(kknn_spec) 
+
+kknn_params <- parameters(kknn_spec) |> 
+  update(neighbors = neighbors(),
+         weight_func = weight_func())
+
+set.seed(82231)
+kknn_tune <-
+  tune_bayes(kknn_workflow, 
+             resamples = mh_fold,
+             param_info = kknn_params,
+             iter = 10,
+             initial = 15,
+             control = control_bayes(verbose = T,
+                                     verbose_iter = T),
+             metrics = metric_set(pr_auc, precision, recall, 
+                                  f_meas, accuracy))
+
+#Finalizing model based on best parameters
+kknn_best <- select_best(kknn_tune, metric = "pr_auc")
+final_kknn_wf <- finalize_workflow(kknn_workflow, kknn_best)
+final_kknn_fit <- last_fit(final_kknn_wf, mh_split)
+
+#Test Metrics
+#Pr-AUC
+final_kknn_fit |> 
+  collect_predictions() |> 
+  pr_auc(Depression_Label, `.pred_Mild Depression`,
+         `.pred_Minimal Depression`, 
+         `.pred_Moderate Depression`,,
+         `.pred_Moderately Severe Depression`,
+         `.pred_No Depression`, `.pred_Severe Depression`)
+
+#Accuracy
+final_kknn_fit |> 
+  collect_predictions() |> 
+  accuracy(.pred_class, Depression_Label)
+
+#F1 score
+final_kknn_fit |> 
+  collect_predictions() |> 
+  f_meas(.pred_class, Depression_Label)
+```
+
+
+```{r xg-boost}
+xgboost_recipe <- 
+  recipe(formula = Depression_Label ~ Self_Worth + 
+         Suicidal_Thoughts + Fatigue + Concentration_Difficulty+
+           Appetite_Changes + Movement_Changes + 
+           Sleep_Disturbance + Loss_of_Interest + Fear_Frequency+
+           Excessive_Worry, data = mh_train) %>% 
+  step_zv(all_predictors()) |> 
+  step_smote(Depression_Label)
+
+xgboost_spec <- 
+  boost_tree(trees = 1e3, learn_rate = tune("learn_rate"), 
+             mtry = tune("mtry")) %>% 
+  set_mode("classification") %>% 
+  set_engine("xgboost") 
+
+xgboost_workflow <- 
+  workflow() %>% 
+  add_recipe(xgboost_recipe) %>% 
+  add_model(xgboost_spec) 
+
+xgboost_params <- parameters(xgboost_spec) |> 
+  update(learn_rate = learn_rate(),
+         mtry = mtry(range = c(1, 10)))
+
+set.seed(23835)
+xgboost_tune <-
+  tune_bayes(xgboost_workflow, 
+             resamples = mh_fold,
+             param_info = xgboost_params,
+             iter = 10,
+             initial = 15,
+             control = control_bayes(verbose = T,
+                                     verbose_iter = T),
+             metrics = metric_set(pr_auc, precision, recall, 
+                                  f_meas, accuracy))
+
+#Finalizing model based on best parameters
+xgboost_best <- select_best(xgboost_tune, metric = "pr_auc")
+final_xgboost_wf <- finalize_workflow(xgboost_workflow,
+                                      xgboost_best)
+final_xgboost_fit <- last_fit(final_xgboost_wf, mh_split)
+
+#Test Metrics
+#Pr-AUC
+final_xgboost_fit |> 
+  collect_predictions() |> 
+  pr_auc(Depression_Label, `.pred_Mild Depression`,
+         `.pred_Minimal Depression`, 
+         `.pred_Moderate Depression`,,
+         `.pred_Moderately Severe Depression`,
+         `.pred_No Depression`, `.pred_Severe Depression`)
+
+#Accuracy
+final_xgboost_fit |> 
+  collect_predictions() |> 
+  accuracy(.pred_class, Depression_Label)
+
+#F1 score
+final_xgboost_fit |> 
+  collect_predictions() |> 
+  f_meas(.pred_class, Depression_Label)
+```
+
+
+```{r}
+#Explainable AI
+X_train <- mh_train %>% dplyr::select(-Depression_Label)
+
+predict_function <- function(model, newdata) {
+  predict(extract_fit_parsnip(model), newdata, type = "prob")$`.pred_No Depression`
+}
+
+predictor <- Predictor$new(final_ann_fit,
+                           data = X_train, 
+                           y = mh_train$Depression_Label,
+                           predict.function = 
+                             predict_function)
+
+#Accumulated  Local Effects
+ale <- FeatureEffect$new(predictor, feature = "Self_Worth", grid.size = 10)
+ale$plot()
+#Change "feature" to see different ALE's
+
+#Interaction effects between predictors
+interact <- Interaction$new(predictor, grid.size = 15)
+plot(interact) + theme_minimal()
+
+#Interaction strength between predictors and concentration difficulty. Change the feature to see interaction between predictors
+iinteract <- Interaction$new(predictor, feature =
+                               "Concentration_Difficulty",
+                             grid.size = 15)
+plot(iinteract) + theme_minimal()
+```
+
